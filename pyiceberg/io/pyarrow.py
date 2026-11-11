@@ -1227,6 +1227,109 @@ def _combine_positional_deletes(positional_deletes: list[pa.ChunkedArray], start
     return pc.subtract(result, pa.scalar(start_index))
 
 
+@dataclass(frozen=True, slots=True)
+class EqualityDelete:
+    """An equality delete file materialized into Arrow arrays.
+
+    Attributes:
+        equality_ids: Field IDs of the delete keys, in the order of the columns in ``table``.
+        table: Rows that should be removed from data files when all key columns match.
+    """
+
+    equality_ids: tuple[int, ...]
+    table: pa.Table
+
+
+def _read_equality_delete_file(io: FileIO, delete_file: DataFile, name_mapping: NameMapping | None) -> EqualityDelete:
+    """Read an equality delete file into an Arrow table.
+
+    The delete file columns are resolved by field ID so that renaming a column after the
+    delete file was written does not break the equality matching.
+    """
+    _check_encryption_supported(delete_file)
+    equality_ids = delete_file.equality_ids
+    if not equality_ids:
+        raise ValueError(f"Equality delete file does not define any equality field ids: {delete_file.file_path}")
+
+    with io.new_input(delete_file.file_path).open() as fi:
+        fragment = _create_arrow_read_format(
+            delete_file.file_format,
+            delete_file.key_metadata,
+            pre_buffer=True,
+            buffer_size=ONE_MEGABYTE,
+        ).make_fragment(fi)
+        delete_schema = pyarrow_to_schema(fragment.physical_schema, name_mapping)
+
+        # Map the equality field IDs to the column names in the delete file. Field IDs are
+        # stable across renames, so matching by ID avoids accidental matches on stale names.
+        column_names: list[str] = []
+        for field_id in equality_ids:
+            column_name = delete_schema.find_column_name(field_id)
+            if column_name is None:
+                raise ValueError(f"Equality delete file {delete_file.file_path} does not contain field with id {field_id}")
+            column_names.append(column_name)
+
+        table = ds.Scanner.from_fragment(fragment=fragment, columns=column_names).to_table()
+
+    return EqualityDelete(equality_ids=tuple(equality_ids), table=table)
+
+
+def _equality_delete_mask(batch: pa.RecordBatch, equality_delete: EqualityDelete, file_schema: Schema) -> pa.Array | None:
+    """Build a boolean mask of the rows in ``batch`` removed by an equality delete file.
+
+    Matching is performed on field IDs rather than column names, so renamed columns still
+    match their delete keys. Rows containing a null in any key column are never removed:
+    equality is three-valued and a null key cannot match a delete row.
+    """
+    data_columns: list[pa.Array] = []
+    delete_columns: list[pa.Array] = []
+    null_masks: list[pa.Array] = []
+
+    for index, field_id in enumerate(equality_delete.equality_ids):
+        column_name = file_schema.find_column_name(field_id)
+        if column_name is None or column_name not in batch.schema.names:
+            # The data file predates the delete key; every value is implicitly null,
+            # which can never match an equality delete.
+            return None
+        data_column = batch.column(column_name)
+        delete_column = equality_delete.table.column(index).combine_chunks()
+        if pa.types.is_dictionary(data_column.type):
+            data_column = data_column.cast(data_column.type.value_type)
+        if delete_column.type != data_column.type:
+            delete_column = delete_column.cast(data_column.type)
+        data_columns.append(data_column)
+        delete_columns.append(delete_column)
+        null_masks.append(pc.is_null(data_column))
+
+    has_null_key = functools.reduce(pc.or_, null_masks)
+
+    if len(equality_delete.equality_ids) == 1:
+        # pc.is_in treats nulls as equal, so null-keyed rows have to be excluded explicitly.
+        matched = pc.is_in(data_columns[0], value_set=pa.chunked_array([delete_columns[0]]))
+    else:
+        # A tuple-wise match cannot be expressed with per-column is_in (that would match
+        # cross products of key values), so perform a left join on all key columns.
+        key_names = [f"_eq_field_{field_id}" for field_id in equality_delete.equality_ids]
+        data_keys = pa.Table.from_arrays(data_columns, names=key_names)
+        # Duplicate delete rows must not duplicate joined data rows; the key set is all that matters.
+        delete_keys = pa.Table.from_arrays(delete_columns, names=key_names).group_by(key_names).aggregate([])
+        sentinel_name = "_equality_delete_matched"
+        delete_keys = delete_keys.append_column(sentinel_name, pa.array([True] * delete_keys.num_rows))
+        joined = data_keys.join(delete_keys, keys=key_names, join_type="left outer")
+        # Rows without a join partner (including rows with null keys) get a null sentinel.
+        matched = pc.is_valid(joined.column(sentinel_name))
+
+    return pc.and_(matched, pc.invert(has_null_key))
+
+
+def _filter_batch(batch: pa.RecordBatch, mask: pa.Array) -> pa.RecordBatch:
+    """Keep the rows of a batch where ``mask`` is false, supporting empty results on all PyArrow versions."""
+    table = pa.Table.from_batches([batch]).filter(pc.invert(mask))
+    if table.num_rows == 0:
+        return batch.slice(0, 0)
+    return table.combine_chunks().to_batches()[0]
+
+
 def pyarrow_to_schema(
     schema: pa.Schema,
     name_mapping: NameMapping | None = None,
@@ -1735,6 +1838,7 @@ def _task_to_record_batches(
     format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION,
     downcast_ns_timestamp_to_us: bool | None = None,
     dictionary_columns: tuple[str, ...] = (),
+    equality_deletes: list[EqualityDelete] | None = None,
 ) -> Iterator[pa.RecordBatch]:
     _check_encryption_supported(task.file)
     format_kwargs: dict[str, Any] = {"pre_buffer": True, "buffer_size": ONE_MEGABYTE * 8}
@@ -1801,6 +1905,17 @@ def _task_to_record_batches(
                     else:
                         current_batch = table.combine_chunks().to_batches()[0]
 
+            if equality_deletes and current_batch.num_rows > 0:
+                # Equality deletes are applied after position deletes. Matching uses the
+                # data file's schema so keys are resolved by field ID, which keeps the
+                # semantics correct when columns have been renamed.
+                for equality_delete in equality_deletes:
+                    mask = _equality_delete_mask(current_batch, equality_delete, file_schema)
+                    if mask is not None:
+                        current_batch = _filter_batch(current_batch, mask)
+                    if current_batch.num_rows == 0:
+                        break
+
             # skip empty batches
             if current_batch.num_rows == 0:
                 continue
@@ -1824,28 +1939,52 @@ class _DeleteFileKey:
     content_size_in_bytes: int | None
 
 
-def _read_all_delete_files(io: FileIO, tasks: Iterable[FileScanTask]) -> dict[str, list[ChunkedArray]]:
-    deletes_per_file: dict[str, list[ChunkedArray]] = {}
+def _read_all_delete_files(
+    io: FileIO, tasks: Iterable[FileScanTask], name_mapping: NameMapping | None = None
+) -> tuple[dict[str, list[ChunkedArray]], dict[str, list[EqualityDelete]]]:
+    positional_deletes_per_file: dict[str, list[ChunkedArray]] = {}
+    equality_deletes_per_file: dict[str, list[EqualityDelete]] = {}
     # DataFile equality uses only the path; DVs from different tasks may share a file.
-    unique_deletes: dict[_DeleteFileKey, DataFile] = {}
-    for task in tasks:
+    unique_positional_deletes: dict[_DeleteFileKey, DataFile] = {}
+    unique_equality_deletes: dict[_DeleteFileKey, DataFile] = {}
+    materialized_tasks = tuple(tasks)
+    for task in materialized_tasks:
         for delete_file in task.delete_files:
             key = _DeleteFileKey(delete_file.file_path, delete_file.content_offset, delete_file.content_size_in_bytes)
-            unique_deletes.setdefault(key, delete_file)
-    if len(unique_deletes) > 0:
+            if delete_file.content == DataFileContent.EQUALITY_DELETES:
+                unique_equality_deletes.setdefault(key, delete_file)
+            else:
+                unique_positional_deletes.setdefault(key, delete_file)
+    if len(unique_positional_deletes) > 0:
         executor = ExecutorFactory.get_or_create()
         deletes_per_files: Iterator[dict[str, ChunkedArray]] = executor.map(
             lambda args: _read_deletes(*args),
-            [(io, delete_file) for delete_file in unique_deletes.values()],
+            [(io, delete_file) for delete_file in unique_positional_deletes.values()],
         )
         for delete in deletes_per_files:
             for file, arr in delete.items():
-                if file in deletes_per_file:
-                    deletes_per_file[file].append(arr)
+                if file in positional_deletes_per_file:
+                    positional_deletes_per_file[file].append(arr)
                 else:
-                    deletes_per_file[file] = [arr]
+                    positional_deletes_per_file[file] = [arr]
 
-    return deletes_per_file
+    if len(unique_equality_deletes) > 0:
+        executor = ExecutorFactory.get_or_create()
+        equality_delete_files: Iterator[EqualityDelete] = executor.map(
+            lambda args: _read_equality_delete_file(*args),
+            [(io, delete_file, name_mapping) for delete_file in unique_equality_deletes.values()],
+        )
+        materialized_equality_deletes = dict(zip(unique_equality_deletes.keys(), equality_delete_files, strict=True))
+        # An equality delete applies to every data file in the same scan task; the planner
+        # has already filtered it by partition and sequence number.
+        for task in materialized_tasks:
+            for delete_file in task.delete_files:
+                if delete_file.content != DataFileContent.EQUALITY_DELETES:
+                    continue
+                key = _DeleteFileKey(delete_file.file_path, delete_file.content_offset, delete_file.content_size_in_bytes)
+                equality_deletes_per_file.setdefault(task.file.file_path, []).append(materialized_equality_deletes[key])
+
+    return positional_deletes_per_file, equality_deletes_per_file
 
 
 class ArrowScan:
@@ -1899,6 +2038,19 @@ class ArrowScan:
             if not isinstance(self._projected_schema.find_type(id), (MapType, ListType))
         }.union(extract_field_ids(self._bound_row_filter))
 
+    def _equality_field_ids(self, tasks: Iterable[FileScanTask]) -> set[int]:
+        """Field IDs of all equality delete keys attached to the scan tasks.
+
+        Equality key columns must be read even when the query does not select them,
+        otherwise the deleted rows could not be evaluated.
+        """
+        field_ids: set[int] = set()
+        for task in tasks:
+            for delete_file in task.delete_files:
+                if delete_file.content == DataFileContent.EQUALITY_DELETES and delete_file.equality_ids:
+                    field_ids.update(delete_file.equality_ids)
+        return field_ids
+
     def to_table(self, tasks: Iterable[FileScanTask]) -> pa.Table:
         """Scan the Iceberg table and return a pa.Table.
 
@@ -1951,7 +2103,12 @@ class ArrowScan:
             ResolveError: When a required field cannot be found in the file
             ValueError: When a field type in the file cannot be projected to the schema type
         """
-        deletes_per_file = _read_all_delete_files(self._io, tasks)
+        # The tasks are consumed twice: once to load the delete files and again to build the
+        # record batches, so materialize any iterable up front.
+        materialized_tasks = tuple(tasks)
+        deletes_per_file, equality_deletes_per_file = _read_all_delete_files(
+            self._io, materialized_tasks, self._table_metadata.name_mapping()
+        )
 
         total_row_count = 0
         executor = ExecutorFactory.get_or_create()
@@ -1960,10 +2117,10 @@ class ArrowScan:
             # Materialize the iterator here to ensure execution happens within the executor.
             # Otherwise, the iterator would be lazily consumed later (in the main thread),
             # defeating the purpose of using executor.map.
-            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file))
+            return list(self._record_batches_from_scan_tasks_and_deletes([task], deletes_per_file, equality_deletes_per_file))
 
         limit_reached = False
-        for batches in executor.map(batches_for_task, tasks):
+        for batches in executor.map(batches_for_task, materialized_tasks):
             for batch in batches:
                 current_batch_size = len(batch)
                 if self._limit is not None and total_row_count + current_batch_size >= self._limit:
@@ -1980,10 +2137,18 @@ class ArrowScan:
                 break
 
     def _record_batches_from_scan_tasks_and_deletes(
-        self, tasks: Iterable[FileScanTask], deletes_per_file: dict[str, list[ChunkedArray]]
+        self,
+        tasks: Iterable[FileScanTask],
+        deletes_per_file: dict[str, list[ChunkedArray]],
+        equality_deletes_per_file: dict[str, list[EqualityDelete]] | None = None,
     ) -> Iterator[pa.RecordBatch]:
         total_row_count = 0
-        for task in tasks:
+        materialized_tasks = tuple(tasks)
+        # Equality key columns have to be read from the data files even if the query
+        # projection does not select them.
+        equality_field_ids = self._equality_field_ids(materialized_tasks)
+        projected_field_ids = self._projected_field_ids.union(equality_field_ids)
+        for task in materialized_tasks:
             if self._limit is not None and total_row_count >= self._limit:
                 break
             batches = _task_to_record_batches(
@@ -1992,7 +2157,7 @@ class ArrowScan:
                 self._bound_row_filter,
                 self._projected_schema,
                 self._table_metadata.schema(),
-                self._projected_field_ids,
+                projected_field_ids,
                 deletes_per_file.get(task.file.file_path),
                 self._case_sensitive,
                 self._table_metadata.name_mapping(),
@@ -2000,6 +2165,7 @@ class ArrowScan:
                 self._table_metadata.format_version,
                 self._downcast_ns_timestamp_to_us,
                 self._dictionary_columns,
+                equality_deletes=(equality_deletes_per_file or {}).get(task.file.file_path),
             )
             for batch in batches:
                 if self._limit is not None:

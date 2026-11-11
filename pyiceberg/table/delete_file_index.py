@@ -20,7 +20,7 @@ from bisect import bisect_left
 
 from pyiceberg.expressions import EqualTo
 from pyiceberg.expressions.visitors import _InclusiveMetricsEvaluator
-from pyiceberg.manifest import INITIAL_SEQUENCE_NUMBER, POSITIONAL_DELETE_SCHEMA, DataFile, ManifestEntry
+from pyiceberg.manifest import INITIAL_SEQUENCE_NUMBER, POSITIONAL_DELETE_SCHEMA, DataFile, DataFileContent, ManifestEntry
 from pyiceberg.typedef import Record
 
 PATH_FIELD_ID = 2147483546
@@ -103,18 +103,27 @@ def _partition_key(spec_id: int, partition: Record | None) -> tuple[int, Record]
 
 
 class DeleteFileIndex:
-    """Indexes position delete files by partition and by exact data file path."""
+    """Indexes position and equality delete files by partition and by exact data file path."""
 
     def __init__(self) -> None:
         self._by_partition: dict[tuple[int, Record], PositionDeletes] = {}
         self._by_path: dict[str, PositionDeletes] = {}
+        # Equality delete files are not tied to a specific data file path, only to a partition.
+        self._equality_by_partition: dict[tuple[int, Record], PositionDeletes] = {}
 
     def is_empty(self) -> bool:
-        return not self._by_partition and not self._by_path
+        return not self._by_partition and not self._by_path and not self._equality_by_partition
 
     def add_delete_file(self, manifest_entry: ManifestEntry, partition_key: Record | None = None) -> None:
         delete_file = manifest_entry.data_file
         seq = manifest_entry.sequence_number or INITIAL_SEQUENCE_NUMBER
+
+        if delete_file.content == DataFileContent.EQUALITY_DELETES:
+            key = _partition_key(delete_file.spec_id or 0, partition_key)
+            deletes = self._equality_by_partition.setdefault(key, PositionDeletes())
+            deletes.add(delete_file, seq)
+            return
+
         target_path = delete_file.referenced_data_file or _referenced_data_file_path(delete_file)
 
         if target_path:
@@ -144,6 +153,12 @@ class DeleteFileIndex:
         if path_deletes:
             deletes.update(path_deletes.filter_by_seq(seq_num))
 
+        # Equality deletes apply to all data files in the same partition whose sequence
+        # number is not greater than the delete file's sequence number.
+        equality_deletes = self._equality_by_partition.get(key)
+        if equality_deletes:
+            deletes.update(equality_deletes.filter_by_seq(seq_num))
+
         return deletes
 
     def referenced_delete_files(self) -> list[DataFile]:
@@ -153,6 +168,9 @@ class DeleteFileIndex:
             data_files.extend(deletes.referenced_delete_files())
 
         for deletes in self._by_path.values():
+            data_files.extend(deletes.referenced_delete_files())
+
+        for deletes in self._equality_by_partition.values():
             data_files.extend(deletes.referenced_delete_files())
 
         return data_files

@@ -2318,20 +2318,13 @@ class FileScanTask(ScanTask):
 
         Returns:
             A FileScanTask with the converted data and delete files.
-
-        Raises:
-            NotImplementedError: If equality delete files are encountered.
         """
-        from pyiceberg.catalog.rest.scan_planning import RESTEqualityDeleteFile
-
         data_file = _rest_file_to_data_file(rest_task.data_file)
 
         resolved_deletes: set[DataFile] = set()
         if rest_task.delete_file_references:
             for idx in rest_task.delete_file_references:
                 delete_file = delete_files[idx]
-                if isinstance(delete_file, RESTEqualityDeleteFile):
-                    raise NotImplementedError(f"PyIceberg does not yet support equality deletes: {delete_file.file_path}")
                 resolved_deletes.add(_rest_file_to_data_file(delete_file, default_referenced_data_file=data_file.file_path))
 
         return FileScanTask(
@@ -2343,7 +2336,7 @@ class FileScanTask(ScanTask):
 
 def _rest_file_to_data_file(rest_file: RESTContentFile, default_referenced_data_file: str | None = None) -> DataFile:
     """Convert a REST content file to a manifest DataFile."""
-    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTPositionDeleteFile
+    from pyiceberg.catalog.rest.scan_planning import RESTDataFile, RESTEqualityDeleteFile, RESTPositionDeleteFile
 
     if isinstance(rest_file, RESTDataFile):
         column_sizes = rest_file.column_sizes.to_dict() if rest_file.column_sizes else None
@@ -2378,6 +2371,7 @@ def _rest_file_to_data_file(rest_file: RESTContentFile, default_referenced_data_
         value_counts=value_counts,
         null_value_counts=null_value_counts,
         nan_value_counts=nan_value_counts,
+        equality_ids=rest_file.equality_ids if isinstance(rest_file, RESTEqualityDeleteFile) else None,
         split_offsets=rest_file.split_offsets,
         sort_order_id=rest_file.sort_order_id,
         referenced_data_file=referenced_data_file,
@@ -2938,7 +2932,7 @@ class ManifestGroupPlanner:
             elif data_file.content == DataFileContent.POSITION_DELETES:
                 delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
             elif data_file.content == DataFileContent.EQUALITY_DELETES:
-                raise ValueError("PyIceberg does not yet support equality deletes: https://github.com/apache/iceberg/issues/6568")
+                delete_index.add_delete_file(manifest_entry, partition_key=data_file.partition)
             else:
                 raise ValueError(f"Unknown DataFileContent ({data_file.content}): {manifest_entry}")
 

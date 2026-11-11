@@ -22,11 +22,23 @@ from collections.abc import Callable
 import pytest
 
 import pyiceberg.table as table_module
-from pyiceberg.expressions import BooleanExpression, EqualTo, GreaterThan
-from pyiceberg.manifest import DataFile, FileFormat
+from pyiceberg.expressions import AlwaysTrue, BooleanExpression, EqualTo, GreaterThan
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.manifest import (
+    DataFile,
+    DataFileContent,
+    FileFormat,
+    ManifestEntry,
+    ManifestEntryStatus,
+    write_manifest,
+)
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import ManifestGroupPlanner, Table
+from pyiceberg.table import FileScanTask, ManifestGroupPlanner, Table
+from pyiceberg.table.metadata import TableMetadataV2
+from pyiceberg.transforms import IdentityTransform
 from pyiceberg.typedef import Record, StructProtocol
+from pyiceberg.types import IntegerType, NestedField
 
 
 def _data_file(file_number: int, partition_value: int) -> DataFile:
@@ -92,3 +104,163 @@ def test_metrics_evaluator_prepares_once_per_plan(table_v2: Table, monkeypatch: 
     assert metrics_evaluator(first_file)
     assert metrics_evaluator(second_file)
     assert instances[0].calls == [first_file, second_file]
+
+
+def _manifest_entry(
+    *,
+    content: DataFileContent,
+    file_path: str,
+    sequence_number: int,
+    partition: Record,
+    snapshot_id: int,
+    equality_ids: list[int] | None = None,
+) -> ManifestEntry:
+    data_file = DataFile.from_args(
+        content=content,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition=partition,
+        record_count=1,
+        file_size_in_bytes=100,
+        equality_ids=equality_ids,
+    )
+    data_file.spec_id = 0
+    return ManifestEntry.from_args(
+        status=ManifestEntryStatus.ADDED,
+        snapshot_id=snapshot_id,
+        sequence_number=sequence_number,
+        file_sequence_number=sequence_number,
+        data_file=data_file,
+    )
+
+
+def test_plan_files_with_equality_deletes(tmp_path: str) -> None:
+    schema = Schema(NestedField(field_id=1, name="x", field_type=IntegerType(), required=True), schema_id=0)
+    spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=IdentityTransform(), name="x"), spec_id=0)
+    io = PyArrowFileIO()
+
+    partition_1 = Record(1)
+    partition_2 = Record(2)
+    data_file_1 = f"{tmp_path}/data-1.parquet"
+    data_file_2 = f"{tmp_path}/data-2.parquet"
+
+    manifest_path = f"{tmp_path}/manifest.avro"
+    with write_manifest(2, spec, schema, io.new_output(manifest_path), snapshot_id=1, avro_compression="null") as writer:
+        # Data files at sequence number 1.
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.DATA,
+                file_path=data_file_1,
+                sequence_number=1,
+                partition=partition_1,
+                snapshot_id=1,
+            )
+        )
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.DATA,
+                file_path=data_file_2,
+                sequence_number=4,
+                partition=partition_2,
+                snapshot_id=1,
+            )
+        )
+        # Equality delete at sequence number 2, only for partition 1.
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.EQUALITY_DELETES,
+                file_path=f"{tmp_path}/eq-delete.parquet",
+                sequence_number=2,
+                partition=partition_1,
+                snapshot_id=1,
+                equality_ids=[1],
+            )
+        )
+        # Equality delete at sequence number 3 for partition 2; the data file there has
+        # sequence number 4, so this delete must not be applied to it.
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.EQUALITY_DELETES,
+                file_path=f"{tmp_path}/eq-delete-future.parquet",
+                sequence_number=3,
+                partition=partition_2,
+                snapshot_id=1,
+                equality_ids=[1],
+            )
+        )
+
+    table_metadata = TableMetadataV2(
+        location=str(tmp_path),
+        last_column_id=1,
+        format_version=2,
+        current_schema_id=0,
+        schemas=[schema],
+        partition_specs=[spec],
+    )
+    planner = ManifestGroupPlanner(table_metadata=table_metadata, io=io, row_filter=AlwaysTrue())
+    tasks = list(planner.plan_files([writer.to_manifest_file()]))
+
+    tasks_by_path = {task.file.file_path: task for task in tasks}
+    assert set(tasks_by_path) == {data_file_1, data_file_2}
+
+    partition_1_deletes = tasks_by_path[data_file_1].delete_files
+    assert len(partition_1_deletes) == 1
+    assert next(iter(partition_1_deletes)).content == DataFileContent.EQUALITY_DELETES
+
+    # The future delete (seq 3) does not apply to the data file with seq 4.
+    assert tasks_by_path[data_file_2].delete_files == set()
+
+
+def test_plan_files_keeps_position_and_equality_deletes(tmp_path: str) -> None:
+    schema = Schema(NestedField(field_id=1, name="x", field_type=IntegerType(), required=True), schema_id=0)
+    spec = PartitionSpec()
+    io = PyArrowFileIO()
+
+    manifest_path = f"{tmp_path}/manifest.avro"
+    with write_manifest(2, spec, schema, io.new_output(manifest_path), snapshot_id=1, avro_compression="null") as writer:
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.DATA,
+                file_path=f"{tmp_path}/data.parquet",
+                sequence_number=1,
+                partition=Record(),
+                snapshot_id=1,
+            )
+        )
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.POSITION_DELETES,
+                file_path=f"{tmp_path}/position-delete.parquet",
+                sequence_number=2,
+                partition=Record(),
+                snapshot_id=1,
+            )
+        )
+        writer.add_entry(
+            _manifest_entry(
+                content=DataFileContent.EQUALITY_DELETES,
+                file_path=f"{tmp_path}/equality-delete.parquet",
+                sequence_number=2,
+                partition=Record(),
+                snapshot_id=1,
+                equality_ids=[1],
+            )
+        )
+
+    table_metadata = TableMetadataV2(
+        location=str(tmp_path),
+        last_column_id=1,
+        format_version=2,
+        current_schema_id=0,
+        schemas=[schema],
+        partition_specs=[spec],
+    )
+    planner = ManifestGroupPlanner(table_metadata=table_metadata, io=io, row_filter=AlwaysTrue())
+    tasks = list(planner.plan_files([writer.to_manifest_file()]))
+
+    assert len(tasks) == 1
+    task: FileScanTask = tasks[0]
+    assert {delete_file.content for delete_file in task.delete_files} == {
+        DataFileContent.POSITION_DELETES,
+        DataFileContent.EQUALITY_DELETES,
+    }

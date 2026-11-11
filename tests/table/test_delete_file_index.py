@@ -64,6 +64,26 @@ def _create_partition_delete(sequence_number: int = 1, spec_id: int = 0, partiti
     return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
 
 
+def _create_equality_delete(
+    sequence_number: int = 1,
+    spec_id: int = 0,
+    partition: Record | None = None,
+    equality_ids: list[int] | None = None,
+    file_path: str | None = None,
+) -> ManifestEntry:
+    delete_file = DataFile.from_args(
+        content=DataFileContent.EQUALITY_DELETES,
+        file_path=file_path or f"s3://bucket/eq-delete-{sequence_number}.parquet",
+        file_format=FileFormat.PARQUET,
+        partition=partition or Record(),
+        record_count=10,
+        file_size_in_bytes=100,
+        equality_ids=equality_ids or [1],
+    )
+    delete_file._spec_id = spec_id
+    return ManifestEntry.from_args(status=ManifestEntryStatus.ADDED, sequence_number=sequence_number, data_file=delete_file)
+
+
 def _create_deletion_vector(
     sequence_number: int = 1,
     file_path: str = "s3://bucket/data.parquet",
@@ -240,3 +260,56 @@ def test_record_equality_for_nan_partition_lookup() -> None:
     index.add_delete_file(_create_partition_delete(sequence_number=2, partition=Record(float("nan"))), Record(float("nan")))
 
     assert len(index.for_data_file(1, _create_data_file(), Record(float("nan")))) == 1
+
+
+def test_equality_delete_scoped_by_partition() -> None:
+    index = DeleteFileIndex()
+    partition_1 = Record(1)
+    partition_2 = Record(2)
+
+    index.add_delete_file(_create_equality_delete(sequence_number=2, partition=partition_1), partition_1)
+    index.add_delete_file(_create_equality_delete(sequence_number=2, partition=partition_2), partition_2)
+
+    data_file = _create_data_file()
+    assert len(index.for_data_file(1, data_file, partition_1)) == 1
+    assert len(index.for_data_file(1, data_file, partition_2)) == 1
+    assert not index.for_data_file(1, data_file, Record(3))
+
+
+def test_equality_delete_scoped_by_sequence_number() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=3, partition=Record()), Record())
+
+    data_file = _create_data_file()
+    assert len(index.for_data_file(3, data_file, Record())) == 1
+    assert len(index.for_data_file(4, data_file, Record())) == 0
+
+
+def test_equality_delete_mixed_with_position_deletes() -> None:
+    index = DeleteFileIndex()
+    partition = Record(1)
+
+    index.add_delete_file(_create_positional_delete(sequence_number=2), partition)
+    index.add_delete_file(_create_equality_delete(sequence_number=3, partition=partition), partition)
+
+    result = index.for_data_file(1, _create_data_file(), partition)
+    assert len(result) == 2
+    contents = {delete_file.content for delete_file in result}
+    assert contents == {DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES}
+
+
+def test_equality_delete_keeps_equality_ids() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_equality_delete(sequence_number=2, partition=Record(), equality_ids=[7, 9]), Record())
+
+    delete_files = index.for_data_file(1, _create_data_file(), Record())
+    assert len(delete_files) == 1
+    assert next(iter(delete_files)).equality_ids == [7, 9]
+
+
+def test_referenced_delete_files_include_equality_deletes() -> None:
+    index = DeleteFileIndex()
+    index.add_delete_file(_create_positional_delete(sequence_number=2), Record())
+    index.add_delete_file(_create_equality_delete(sequence_number=3, partition=Record()), Record())
+
+    assert len(index.referenced_delete_files()) == 2
